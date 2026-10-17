@@ -1,0 +1,33 @@
+[package]
+name = "ext-php-rs-build-script-tests"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "windows-build-script"
+path = "../../build.rs"
+
+[dependencies]
+anyhow.workspace = true
+ext-php-rs-bindgen.workspace = true
+cc.workspace = true
+skeptic.workspace = true
+ext-php-rs-build.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+ureq.workspace = true
+zip.workspace = true
+
+[features]
+default = ["enum", "runtime"]
+enum = []
+closure = []
+embed = []
+observer = []
+runtime = ["ext-php-rs-bindgen/runtime"]
+static = ["ext-php-rs-bindgen/static"]
+
+[dev-dependencies]
+tempfile.workspace = true

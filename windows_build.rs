@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ext_php_rs_build::Arch;
 use std::{
     io::{Cursor, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 use ureq::tls::{TlsConfig, TlsProvider};
@@ -137,6 +137,37 @@ fn looks_like_msvc_linker(linker: &Path) -> bool {
 struct DevelPack(PathBuf);
 
 impl DevelPack {
+    fn directory(out_dir: &Path, first_name: &str) -> Result<PathBuf> {
+        let Some(Component::Normal(directory)) = Path::new(first_name).components().next() else {
+            anyhow::bail!("Development pack must have a relative top-level directory");
+        };
+        Ok(out_dir.join(directory))
+    }
+
+    fn extract(out_dir: &Path, content: &[u8]) -> Result<PathBuf> {
+        let mut content = Cursor::new(content);
+        let mut archive =
+            zip::read::ZipArchive::new(&mut content).context("Failed to unzip development pack")?;
+        let first_name = archive
+            .file_names()
+            .next()
+            .transpose()
+            .context("Failed to decode development pack file name")?
+            .context("Failed to get development pack name")?;
+        let directory = Self::directory(out_dir, first_name.as_ref())?;
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("Failed to remove the previous development pack");
+            }
+        }
+        archive
+            .extract(out_dir)
+            .context("Failed to extract development pack")?;
+        Ok(directory)
+    }
+
     /// Downloads a new PHP development pack, unzips it in the build script
     /// temporary directory.
     fn new(version: &str, is_zts: bool, arch: Arch) -> Result<DevelPack> {
@@ -180,11 +211,7 @@ impl DevelPack {
                 )
             };
             let response = ureq::Agent::config_builder()
-                .tls_config(
-                    TlsConfig::builder()
-                        .provider(TlsProvider::NativeTls)
-                        .build(),
-                )
+                .tls_config(TlsConfig::builder().provider(TlsProvider::Rustls).build())
                 .build()
                 .new_agent()
                 .get(&url)
@@ -197,20 +224,7 @@ impl DevelPack {
                 .into_reader()
                 .read_to_end(&mut content)
                 .context("Failed to read development pack")?;
-            let mut content = Cursor::new(&mut content);
-            let mut zip_content = zip::read::ZipArchive::new(&mut content)
-                .context("Failed to unzip development pack")?;
-            let inner_name = zip_content
-                .file_names()
-                .next()
-                .and_then(|f| f.split('/').next())
-                .context("Failed to get development pack name")?;
-            let devpack_path = out_dir.join(inner_name);
-            let _ = std::fs::remove_dir_all(&devpack_path);
-            zip_content
-                .extract(&out_dir)
-                .context("Failed to extract devpack to directory")?;
-            Ok(devpack_path)
+            DevelPack::extract(&out_dir, &content)
         }
 
         // Try multiple sources in order:
@@ -280,5 +294,79 @@ For example: set PHP_LIB=C:\php-sdk\php-dev\vc16\x64\php-8.3.13-src\x64\Debug_TS
             .iter()
             .map(|p| includes.join(p))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DevelPack;
+    use std::{
+        io::{Cursor, Write},
+        path::Path,
+    };
+
+    fn archive(name: &str) -> anyhow::Result<Vec<u8>> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive.start_file(
+            name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )?;
+        archive.write_all(b"selected PHP header")?;
+        Ok(archive.finish()?.into_inner())
+    }
+
+    #[test]
+    fn extraction_replaces_only_the_selected_pack() -> anyhow::Result<()> {
+        let scope = tempfile::tempdir_in(std::env::current_dir()?)?;
+        let pack = scope.path().join("php-devel");
+        std::fs::create_dir(&pack)?;
+        std::fs::write(pack.join("obsolete.h"), b"obsolete")?;
+        let sentinel = scope.path().join("unrelated");
+        std::fs::write(&sentinel, b"retain")?;
+        let directory = DevelPack::extract(scope.path(), &archive("php-devel/include/php.h")?)?;
+        assert_eq!(directory, pack);
+        assert_eq!(
+            std::fs::read(pack.join("include/php.h"))?,
+            b"selected PHP header"
+        );
+        assert!(!pack.join("obsolete.h").exists());
+        assert_eq!(std::fs::read(sentinel)?, b"retain");
+        Ok(())
+    }
+
+    #[test]
+    fn parent_path_archive_preserves_the_output_parent() -> anyhow::Result<()> {
+        let scope = tempfile::tempdir_in(std::env::current_dir()?)?;
+        let output = scope.path().join("output");
+        std::fs::create_dir(&output)?;
+        let sentinel = scope.path().join("sentinel");
+        std::fs::write(&sentinel, b"retain")?;
+        assert!(DevelPack::extract(&output, &archive("../outside")?).is_err());
+        assert_eq!(std::fs::read(sentinel)?, b"retain");
+        Ok(())
+    }
+
+    #[test]
+    fn development_pack_directory_stays_in_its_owned_output() {
+        let output = Path::new(r"C:\owned\output");
+        for name in ["php-devel/", "php-devel/include/php.h"] {
+            assert_eq!(
+                DevelPack::directory(output, name).unwrap(),
+                output.join("php-devel")
+            );
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "/outside",
+            r"\outside",
+            r"C:\outside",
+            r"\\server\share\outside",
+        ] {
+            assert!(DevelPack::directory(output, name).is_err(), "{name}");
+        }
     }
 }
